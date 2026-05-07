@@ -121,6 +121,22 @@ These are the parameter name patterns that produce a working LoRA configuration 
 
 **What does NOT work**: Targeting only `q_proj`, `k_proj`, `v_proj`, `o_proj` (standard LoRA defaults). These only match the 10 standard attention layers, giving ~0.02% trainable parameters and NaN loss during training.
 
+**What we skipped**: `linear_attn.in_proj_a` and `linear_attn.in_proj_b` (DeltaNet gating projections). The model has 12 possible LoRA targets per layer — we used 10 of 12. We haven't tested whether adding these two would help.
+
+### How We Found These Keys
+
+This wasn't planned. We assumed Qwen3.6 was a standard transformer and started with the LoRA targets every tutorial uses. Here's what actually happened:
+
+1. **Attempt 1**: Standard targets (`q_proj`, `k_proj`, `v_proj`, `o_proj`). Result: 0.02% trainable params, NaN loss on the first step. These keys only exist in 10 of the 40 layers — the other 30 are DeltaNet and use completely different parameter names.
+
+2. **Discovery**: Printed the model's full parameter tree (`model.named_parameters()`) and saw names like `linear_attn.in_proj_qkv` where we expected `self_attn.q_proj`. That's when we realized 75% of the layers aren't standard transformers at all.
+
+3. **~15 smoke test runs on Modal**: Tried different combinations of DeltaNet keys, with and without MLP targets, different ranks. Each smoke test (30 iterations) takes a few minutes and costs pennies. We were debugging, not doing controlled ablations — just trying to get loss to stop being NaN.
+
+4. **Working config**: Added `in_proj_qkv`, `in_proj_z`, `out_proj` for DeltaNet layers + standard attention keys + MLP expert keys. Trainable params jumped to 0.055%, loss dropped immediately on the first step. Shipped it.
+
+We don't know which individual keys contribute most. A proper ablation study (testing subsets of targets) would be a good follow-up — smoke tests are cheap enough to do it.
+
 ## Cost Breakdown
 
 | Step | Resource | Time | Cost |
