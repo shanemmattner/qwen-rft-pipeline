@@ -1,0 +1,11 @@
+accelerate
+bitsandbytes
+datasets
+hf-transfer
+huggingface_hub
+modal
+peft
+safetensors
+torch
+transformers>=5.5.0
+trl

@@ -1,0 +1,88 @@
+# LoRA configuration for Qwen3.6-35B-A3B (Hybrid Gated DeltaNet + MoE)
+#
+# This model has a non-standard architecture:
+#   - 30 layers with DeltaNet linear attention (subquadratic)
+#   - 10 layers with standard grouped-query attention
+#   - All 40 layers have MoE FFN (256 experts, 8 active + 1 shared)
+#
+# Standard LoRA targets (q_proj, k_proj, v_proj, o_proj) only reach the
+# 10 standard attention layers -> ~0.02% trainable params -> NaN loss.
+# You MUST include the DeltaNet-specific targets listed below.
+
+model:
+  name: "Qwen/Qwen3.6-35B-A3B"
+  total_params: 35_000_000_000  # approximate
+  active_params: 3_000_000_000  # per token (MoE routing)
+  dtype: "bfloat16"
+  # Do NOT use load_in_4bit/load_in_8bit — QLoRA is unreliable for MoE models
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.0
+  bias: "none"
+  # Target modules — this is the critical part.
+  # All of these are required for stable training.
+  target_modules:
+    # DeltaNet linear attention projections (30 layers)
+    - "in_proj_qkv"    # linear_attn.in_proj_qkv
+    - "in_proj_z"      # linear_attn.in_proj_z
+    - "out_proj"       # linear_attn.out_proj (also matches self_attn.o_proj)
+    # Standard self-attention projections (10 layers)
+    - "q_proj"         # self_attn.q_proj
+    - "k_proj"         # self_attn.k_proj
+    - "v_proj"         # self_attn.v_proj
+    - "o_proj"         # self_attn.o_proj
+    # MoE expert MLPs (256 switch experts + 1 shared expert, all 40 layers)
+    - "gate_proj"      # mlp.switch_mlp.gate_proj + mlp.shared_expert.gate_proj
+    - "up_proj"        # mlp.switch_mlp.up_proj + mlp.shared_expert.up_proj
+    - "down_proj"      # mlp.switch_mlp.down_proj + mlp.shared_expert.down_proj
+
+  # Full parameter path patterns for reference:
+  # model.layers.N.linear_attn.in_proj_qkv   (N in DeltaNet layers)
+  # model.layers.N.linear_attn.in_proj_z     (N in DeltaNet layers)
+  # model.layers.N.linear_attn.out_proj      (N in DeltaNet layers)
+  # model.layers.N.self_attn.q_proj          (N in standard attn layers)
+  # model.layers.N.self_attn.k_proj          (N in standard attn layers)
+  # model.layers.N.self_attn.v_proj          (N in standard attn layers)
+  # model.layers.N.self_attn.o_proj          (N in standard attn layers)
+  # model.layers.N.mlp.switch_mlp.experts.M.gate_proj  (M = 0..255)
+  # model.layers.N.mlp.switch_mlp.experts.M.up_proj
+  # model.layers.N.mlp.switch_mlp.experts.M.down_proj
+  # model.layers.N.mlp.shared_expert.gate_proj
+  # model.layers.N.mlp.shared_expert.up_proj
+  # model.layers.N.mlp.shared_expert.down_proj
+
+  # With these targets: ~0.45% trainable parameters, stable training
+
+training:
+  max_steps: 150
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  # effective batch size: 32
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_steps: 0.06  # fraction of total steps
+  weight_decay: 0.01
+  optimizer: "adamw_8bit"
+  max_seq_length: 2048
+  packing: false
+  seed: 42
+  save_steps: 50
+  eval_steps: 25
+  logging_steps: 5
+
+gpu:
+  type: "H200"
+  # H200 has 141GB HBM3e — bf16 Qwen3.6-35B-A3B uses ~67GB
+  # Modal cost: ~$4.76/hr
+
+generation:
+  # Settings used for generating training data from the base model
+  temperature: 1.6
+  top_k: 20
+  top_p: 0.8
+  num_samples: 2000
+  # Expected pass rate after filtering: ~90%
