@@ -54,7 +54,7 @@ train_image = (
         "transformers>=5.5.0",
         "trl",
     )
-    .env({"HF_HOME": "/model_cache"})
+    .env({"HF_HOME": "/model_cache", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,11 @@ train_image = (
 # ---------------------------------------------------------------------------
 
 with train_image.imports():
+    import hashlib
+    import importlib.metadata as _importlib_metadata
     import json
+    import subprocess
+    import sys
     import time
 
     import torch
@@ -153,7 +157,7 @@ class TrainingConfig:
     packing: bool = False
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
-    warmup_steps: float = 0.06
+    warmup_ratio: float = 0.06
     weight_decay: float = 0.01
     max_steps: int = 150
     save_steps: int = 50
@@ -165,6 +169,7 @@ class TrainingConfig:
     experiment_name: Optional[str] = None
     skip_eval: bool = False
     smoke_test: bool = False
+    lora_targets: Optional[str] = None  # comma-separated override
 
     def __post_init__(self):
         if self.smoke_test:
@@ -259,7 +264,7 @@ def load_model(config):
         config.model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     return model, tokenizer
@@ -269,12 +274,13 @@ def load_model(config):
 # LoRA Setup
 # ---------------------------------------------------------------------------
 
-def setup_model_for_training(model, config):
+def setup_model_for_training(model, config, target_modules=None):
     """Configure LoRA adapters via PEFT."""
-    print("Configuring LoRA for training...")
+    targets = target_modules or LORA_TARGET_MODULES
+    print(f"Configuring LoRA for training with {len(targets)} targets: {targets}")
     lora_config = LoraConfig(
         r=config.lora_r,
-        target_modules=LORA_TARGET_MODULES,
+        target_modules=targets,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias=config.lora_bias,
@@ -296,7 +302,7 @@ def create_training_config(config, output_dir, skip_eval):
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         max_steps=config.max_steps,
-        warmup_steps=config.warmup_steps,
+        warmup_ratio=config.warmup_ratio,
         eval_steps=config.eval_steps,
         save_steps=config.save_steps,
         eval_strategy="no" if skip_eval else "steps",
@@ -440,6 +446,10 @@ class TimingCallback:
     single_use_containers=True,
 )
 def finetune(config: TrainingConfig):
+    # Enable TF32 for faster matmul on Ampere+ GPUs (H200)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     timings = {}
     t_total = time.time()
 
@@ -455,6 +465,34 @@ def finetune(config: TrainingConfig):
         props = torch.cuda.get_device_properties(0)
         print(f"  GPU: {torch.cuda.get_device_name(0)} ({props.total_memory / (1024**3):.0f} GB)")
     print(f"{'='*60}\n")
+
+    # --- Capture environment for provenance ---
+    env_info = {
+        "python_version": sys.version.split()[0],
+        "packages": {},
+        "gpu": {},
+        "cuda": {},
+    }
+
+    for pkg in ["torch", "transformers", "peft", "trl", "datasets", "accelerate", "bitsandbytes"]:
+        try:
+            env_info["packages"][pkg] = _importlib_metadata.version(pkg)
+        except _importlib_metadata.PackageNotFoundError:
+            pass
+
+    if torch.cuda.is_available():
+        env_info["gpu"]["name"] = torch.cuda.get_device_name(0)
+        env_info["gpu"]["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**3))
+        env_info["cuda"]["version"] = torch.version.cuda or "unknown"
+        env_info["cuda"]["cudnn"] = str(torch.backends.cudnn.version()) if torch.backends.cudnn.is_available() else "unknown"
+
+    # Full pip freeze for artifact storage
+    try:
+        pip_freeze = subprocess.run(["pip", "freeze"], capture_output=True, text=True).stdout
+        pip_freeze_sha256 = hashlib.sha256(pip_freeze.encode()).hexdigest()
+    except Exception:
+        pip_freeze = ""
+        pip_freeze_sha256 = ""
 
     # Phase 1: Model load
     t0 = time.time()
@@ -473,9 +511,22 @@ def finetune(config: TrainingConfig):
           f"{len(train_dataset)} train"
           f"{', ' + str(len(eval_dataset)) + ' valid' if eval_dataset else ''}")
 
+    # Hash dataset files for provenance
+    def sha256_file(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    from pathlib import Path as _Path
+    train_sha256 = sha256_file(_Path(DATA_DIR) / "train.jsonl")
+    valid_sha256 = sha256_file(_Path(DATA_DIR) / "valid.jsonl") if (_Path(DATA_DIR) / "valid.jsonl").exists() else ""
+
     # Phase 3: LoRA setup
     t0 = time.time()
-    model = setup_model_for_training(model, config)
+    custom_targets = config.lora_targets.split(",") if config.lora_targets else None
+    model = setup_model_for_training(model, config, target_modules=custom_targets)
     timings["lora_setup_sec"] = round(time.time() - t0, 2)
     alloc, res = gpu_mem_gb()
     print(f"[TIMING] LoRA setup: {timings['lora_setup_sec']}s")
@@ -560,6 +611,94 @@ def finetune(config: TrainingConfig):
     timings["trainable_params"] = trainable_params
     timings["trainable_pct"] = round(trainable_params / total_params * 100, 4)
 
+    # Compute adapter hash for provenance
+    adapter_files = sorted(final_model_path.glob("*.safetensors"))
+    adapter_sha256 = ""
+    if adapter_files:
+        h = hashlib.sha256()
+        for af in adapter_files:
+            h.update(af.read_bytes())
+        adapter_sha256 = h.hexdigest()
+
+    provenance = {
+        "schema_version": "1.0.0",
+        "model_id": config.experiment_name,
+        "created_at": datetime.now().isoformat() + "Z",
+        "description": f"LoRA adapter trained on {config.model_name}",
+
+        "base_model": {
+            "huggingface_id": config.model_name,
+            "commit_sha": "",  # TODO: capture from HF hub API
+        },
+
+        "training": {
+            "method": {
+                "type": "LoRA-RFT",
+                "lora_rank": config.lora_r,
+                "lora_alpha": config.lora_alpha,
+                "lora_target_modules": custom_targets or LORA_TARGET_MODULES,
+                "lora_dropout": config.lora_dropout,
+                "learning_rate": config.learning_rate,
+                "lr_scheduler": config.lr_scheduler_type,
+                "warmup_ratio": config.warmup_ratio,
+                "max_steps": config.max_steps,
+                "batch_size": config.batch_size,
+                "gradient_accumulation_steps": config.gradient_accumulation_steps,
+                "max_seq_length": config.max_seq_length,
+                "optimizer": config.optim,
+                "weight_decay": config.weight_decay,
+                "bf16": torch.cuda.is_bf16_supported(),
+            },
+            "data": {
+                "dataset_files": {
+                    "train_file": "train.jsonl",
+                    "train_sha256": train_sha256,
+                    "train_examples": len(train_dataset),
+                    "valid_file": "valid.jsonl",
+                    "valid_sha256": valid_sha256,
+                    "valid_examples": len(eval_dataset) if eval_dataset else 0,
+                }
+            },
+            "infrastructure": {
+                "provider": "Modal",
+                "gpu": env_info["gpu"],
+                "python_version": env_info["python_version"],
+                "packages": env_info["packages"],
+                "cuda": env_info["cuda"],
+                "pip_freeze_sha256": pip_freeze_sha256,
+                "random_seeds": {
+                    "seed": config.seed,
+                }
+            },
+            "run": {
+                "training_script_repo": "https://gitlab.com/shanemmattner/llm-toolkit",
+                "start_time": datetime.fromtimestamp(t_total).isoformat() + "Z",
+                "end_time": datetime.now().isoformat() + "Z",
+                "gpu_hours": round(timings["total_sec"] / 3600, 3),
+                "final_train_loss": round(result.training_loss, 4),
+                "total_steps": result.global_step,
+            }
+        },
+
+        "artifacts": {
+            "adapter_weights": str(final_model_path),
+            "adapter_sha256": adapter_sha256,
+            "pip_freeze": "pip_freeze.txt",
+        },
+
+        "notes": "",
+    }
+
+    # Save pip freeze as artifact
+    if pip_freeze:
+        with open(final_model_path / "pip_freeze.txt", "w") as f:
+            f.write(pip_freeze)
+
+    # Save provenance
+    with open(final_model_path / "model_provenance.json", "w") as f:
+        json.dump(provenance, f, indent=2, default=str)
+
+    # Keep the existing metadata.json for backward compatibility
     metadata = {
         "experiment": config.experiment_name,
         "model": config.model_name,
@@ -570,6 +709,7 @@ def finetune(config: TrainingConfig):
             "epoch": getattr(result, "epoch", None),
         },
         "timings": timings,
+        "log_history": trainer.state.log_history,
     }
     with open(final_model_path / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -669,7 +809,7 @@ def main(
     packing: bool = False,
     learning_rate: float = 2e-4,
     lr_scheduler_type: str = "cosine",
-    warmup_steps: float = 0.06,
+    warmup_ratio: float = 0.06,
     weight_decay: float = 0.01,
     max_steps: int = 150,
     save_steps: int = 50,
@@ -682,6 +822,7 @@ def main(
     # Flags
     smoke_test: bool = False,
     upload_data: str = "",
+    lora_targets: str = "",
 ):
     if upload_data:
         _do_upload(upload_data)
@@ -703,7 +844,7 @@ def main(
         packing=packing,
         learning_rate=learning_rate,
         lr_scheduler_type=lr_scheduler_type,
-        warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
         weight_decay=weight_decay,
         max_steps=max_steps,
         save_steps=save_steps,
@@ -713,6 +854,7 @@ def main(
         experiment_name=experiment_name,
         skip_eval=skip_eval,
         smoke_test=smoke_test,
+        lora_targets=lora_targets or None,
     )
 
     print(f"Launching: {config.experiment_name} ({config.max_steps} steps, GPU: {GPU_TYPE})")
