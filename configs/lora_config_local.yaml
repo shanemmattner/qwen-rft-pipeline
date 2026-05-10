@@ -1,0 +1,43 @@
+model: "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit"
+
+lora_parameters:
+  keys:
+    # Gated DeltaNet layers (75% of layers)
+    - "linear_attn.in_proj_qkv"
+    - "linear_attn.in_proj_z"
+    - "linear_attn.out_proj"
+    # Standard attention layers (25% of layers)
+    - "self_attn.q_proj"
+    - "self_attn.k_proj"
+    - "self_attn.v_proj"
+    - "self_attn.o_proj"
+    # MoE expert MLPs (all layers)
+    - "mlp.switch_mlp.gate_proj"
+    - "mlp.switch_mlp.up_proj"
+    - "mlp.switch_mlp.down_proj"
+    # Shared expert (all layers)
+    - "mlp.shared_expert.gate_proj"
+    - "mlp.shared_expert.up_proj"
+    - "mlp.shared_expert.down_proj"
+  rank: 8
+  scale: 20.0
+  dropout: 0.0
+
+num_layers: 40
+batch_size: 2
+grad_accumulation_steps: 16
+learning_rate: 2e-5
+iters: 2000
+warmup_iters: 50
+mask_prompt: false
+grad_checkpoint: true
+max_seq_length: 1024
+
+data: "./runs/2026-05-04-ssd-v2/training_data"
+adapter_path: "./runs/2026-05-04-ssd-v2/adapters"
+
+steps_per_report: 10
+steps_per_eval: 100
+val_batches: 25
+save_every: 100
+clear_cache_threshold: 0.5
