@@ -125,17 +125,20 @@ Qwen3 models are sensitive to pruning search algorithm choice. CBO and fast-bloc
 **Purpose**: Recover quality lost to pruning AND add domain-specific knowledge (TunedVoice codebase, coding workflow tasks).
 
 **Duration**: 2-3 days
-**Cost**: ~$9-12 on Modal H200
+**Cost**: ~$18-30 on Modal A100 (down from $125-172 before optimizations)
 **Prerequisite**: Wave 1 complete with acceptable quality retention.
 
 ### Adapter Strategy
 
-Two adapters, trained sequentially and stacked at inference:
+Single mixed-data run combining all categories (eliminates second training job):
 
-| Adapter | Purpose | Training Data | Priority |
-|---------|---------|---------------|----------|
-| RFT (Rejection Fine-Tuning) | Coding task specialization | Generated samples filtered for correctness (temp=1.6, top_k=20, top_p=0.8, ~2000 samples, ~90% pass rate) | First |
-| Q&A Domain | TunedVoice codebase knowledge | 521 Q&A pairs (468 train / 53 valid) from bug-qa, crossfile-qa, deepseek-v4-qa sources | Second (stacked on RFT) |
+| Data Category | % of Dataset | Source |
+|---------------|-------------|--------|
+| Q&A | 40% | 521 Q&A pairs (468 train / 53 valid) from bug-qa, crossfile-qa, deepseek-v4-qa |
+| FIM (fill-in-middle) | 30% | Code completion examples |
+| Commit-to-diff | 15% | Commit message to diff pairs |
+| Bug detection | 10% | Bug identification examples |
+| RFT-filtered | 5% | Generated samples filtered for correctness (temp=1.6, top_k=20, top_p=0.8) |
 
 ### LoRA Configuration (27B Dense)
 
@@ -150,38 +153,39 @@ target_modules:
   - "up_proj"
   - "down_proj"
 
-# Starting config (subject to ablation)
-rank: 16
-alpha: 16
+# Optimized config (r=64 is sufficient for ~2K examples per LoRA Without Regret capacity analysis)
+rank: 64
+alpha: 128
 dropout: 0.0
 bias: none
+base_precision: QLoRA 4-bit  # enables A100 80GB ($2.50/hr) instead of H200 ($4.76/hr)
 ```
 
 ### Training Pipeline
 
 | Step | Action | Time | Cost | Details |
 |------|--------|------|------|---------|
-| 2.1 | 30-step ablation (3 configs) | 45 min | ~$3 | Compare rank 16/32/64, learning rates 1e-4/2e-4/5e-4. Eval at steps 25 and 30. |
+| 2.1 | 30-step ablation (3 configs) | 45 min | ~$3 | Config A: r=32/alpha=64/lr=2e-4. Config B: r=64/alpha=128/lr=2e-4. Config C: r=64/alpha=128/lr=1e-4. All QLoRA 4-bit on A100. |
 | 2.2 | Select winning config | 15 min | $0 | Pick lowest eval_loss. |
-| 2.3 | Full RFT training run | 2-3 hrs | ~$6 | 100-150 steps, effective batch 32, cosine LR schedule. |
-| 2.4 | Evaluate RFT adapter | 1 hr | $0 | Run against 49 fixtures with adapter loaded. |
-| 2.5 | Q&A domain adapter training | 2-3 hrs | ~$6 | Same config, stacked on RFT adapter. |
-| 2.6 | Evaluate stacked adapters | 1 hr | $0 | Run against 49 fixtures with both adapters. |
+| 2.3 | Single mixed-data training run | 3-4 hrs | ~$12-20 | ~120 steps with early stopping, eval every 10 steps. QLoRA 4-bit on A100 ($2.50/hr). |
+| 2.4 | Evaluate adapter | 1 hr | $0 | Run against 49 fixtures with adapter loaded. |
+| 2.5 | Merge + validation | 1-2 hrs | ~$3-5 | Merge adapter, verify quality matches adapter-loaded model. |
 
-### Training Hyperparameters (from A3B winning config, starting point)
+### Training Hyperparameters (optimized from A3B config + cost research)
 
 ```yaml
-max_steps: 150
+max_steps: 120          # ~2 epochs for 2K examples, with early stopping
 batch_size: 4
 gradient_accumulation_steps: 8  # effective batch: 32
-learning_rate: 2.0e-4
+learning_rate: 2.0e-4   # sweep 1e-4 vs 2e-4 in ablation
 lr_scheduler_type: cosine
-warmup_steps: 0.06  # fraction
+warmup_steps: 0.06      # fraction
 weight_decay: 0.01
 optimizer: adamw_8bit
 max_seq_length: 2048
 packing: false
 seed: 42
+eval_steps: 10          # early stopping when eval_loss plateaus for 20+ steps
 ```
 
 ### Key Differences from A3B Fine-Tuning
@@ -194,12 +198,13 @@ seed: 42
 | Base precision | bf16 only (~67 GB on H200) | bf16 (~54 GB) or QLoRA (~15 GB) |
 | Training complexity | High (NaN loss with wrong targets) | Low (standard transformer) |
 
-### Decision: Full Precision LoRA, NOT QLoRA
+### Decision: QLoRA 4-bit on A100
 
-Even though QLoRA is viable for 27B dense, we use full-precision LoRA:
-- Avoids double-quantization (QLoRA base + later 6-bit quantization = compounding errors).
-- H200 has 141 GB HBM3e -- 54 GB base + ~2 GB adapter + optimizer states fits easily.
-- Quality-optimal per the compression ordering research (arxiv 2511.19495).
+QLoRA is the right choice for 27B dense (unlike A3B where MoE routing made QLoRA unreliable):
+- <2% quality loss vs full-precision LoRA (Dettmers et al. 2023, multiple 2025 benchmarks).
+- Reduces base model memory from ~54 GB to ~15 GB, enabling A100 80GB ($2.50/hr) instead of H200 ($4.76/hr).
+- 39% slower per step due to quant/dequant overhead, but ~55% lower total cost per run.
+- Double-quantization concern (QLoRA + later 6-bit deployment) is mitigated: fine-tuning operates on the adapter in full precision, and the base model is re-quantized cleanly for deployment.
 
 ### Risk Assessment
 
@@ -421,13 +426,13 @@ If FastMTP self-distillation fails on pruned architecture:
 |------|----------|------|------------|---------------|
 | 0: Validation | 1 day | $0 | GO/NO-GO on pruning + MTP | Acceptance >= 50%, quality >= 90% of base |
 | 1: Pruning | 1-2 days | $0 | Pruned model (6-8 layers removed) | Quality >= 96% of base |
-| 2: Fine-tuning | 2-3 days | ~$9-12 | RFT + Q&A domain adapters | Eval loss converging, fixture pass rate improving |
+| 2: Fine-tuning | 2-3 days | ~$18-30 | Single mixed-data adapter (QLoRA 4-bit, r=64, A100) | Eval loss converging, fixture pass rate improving |
 | 3: Merge | 2-4 hrs | $0 | Standalone fine-tuned pruned model | Merged == adapter-loaded quality |
 | 4: Quantize | 2-4 hrs | $0 | 6-bit MLX model (~15-18 GB) | < 1% quality loss from quantization |
 | 5: MTP Graft | 2-4 hrs | $0 | Model with MTP speculative decoding | Acceptance >= 40% |
 | 6: Recalibration | 1-2 days | $0 | Recalibrated MTP heads | Acceptance improved over Wave 5 |
 | Deploy | 1 day | $0 | Production model on Mac Studio | Beats A3B baseline |
-| **Total** | **~6-7 days** | **~$9-12** | | |
+| **Total** | **~6-7 days** | **~$18-30** | | |
 
 ### Fallback Chain
 
